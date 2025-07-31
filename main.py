@@ -1,6 +1,7 @@
 import csv
 import requests
 import os
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from google.cloud import storage
@@ -52,7 +53,13 @@ def process_domain(email):
         return get_email_provider(mx_records)
     return "Invalid-Email"
 
-def process_csv(input_file):
+def upload_progress(bucket_name, progress_blob, percent):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(progress_blob)
+    blob.upload_from_string(json.dumps({"progress": percent}), content_type="application/json")
+
+def process_csv(input_file, bucket_name, progress_blob):
     temp_file = input_file + ".tmp"
     with open(input_file, mode="r", newline="", encoding="utf-8") as infile:
         reader = csv.DictReader(infile)
@@ -62,6 +69,7 @@ def process_csv(input_file):
             fieldnames.append("email_host")
 
         rows = list(reader)
+        total = len(rows)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor, \
             open(temp_file, mode="w", newline="", encoding="utf-8") as outfile:
@@ -77,18 +85,28 @@ def process_csv(input_file):
             else:
                 writer.writerow(row)
 
+        completed = 0
+        last_percent = 0
+
         with tqdm(total=len(futures), desc="Processing Emails") as pbar:
             for future in as_completed(futures):
                 row = futures[future]
                 row["email_host"] = future.result()
                 writer.writerow(row)
+                completed += 1
                 pbar.update(1)
+
+                percent = int((completed / total) * 100)
+                if percent >= last_percent + 5:
+                    upload_progress(bucket_name, progress_blob, percent)
+                    last_percent = percent
 
                 if pbar.n % 50 == 0:
                     outfile.flush()
                     os.fsync(outfile.fileno())
 
     os.replace(temp_file, input_file)
+    upload_progress(bucket_name, progress_blob, 100)
     print("CSV processing complete.")
 
 def download_blob(bucket_name, source_blob_name, destination_file_name):
@@ -116,9 +134,10 @@ def main():
     local_file = "/tmp/input.csv"
     download_blob(bucket_name, input_blob, local_file)
 
-    process_csv(local_file)
-
     filename = os.path.basename(input_blob)
+    progress_blob = f"processing/{filename}.progress.json"
+    process_csv(local_file, bucket_name, progress_blob)
+
     output_blob = f"processed/{filename}"
     upload_blob(bucket_name, local_file, output_blob)
 
