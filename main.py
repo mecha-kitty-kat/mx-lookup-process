@@ -176,6 +176,51 @@ def upload_blob(bucket_name, source_file_name, destination_blob_name):
     blob.upload_from_filename(source_file_name)
     print(f"Uploaded processed file to {destination_blob_name} in {bucket_name}.")
 
+def split_and_upload_csv_chunks(csv_path, bucket_name, filename):
+    from datetime import datetime
+
+    # Read rows
+    with open(csv_path, newline='', encoding='utf-8') as csvfile:
+        reader = csv.DictReader(csvfile)
+        headers = reader.fieldnames
+        if "email_host" not in headers:
+            print("❌ 'email_host' header missing in CSV. Exiting.")
+            return
+        rows = list(reader)
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    chunk_size = 40000
+
+    # Separate rows
+    google_rows = [r for r in rows if r["email_host"] == "Google"]
+    others_rows = [r for r in rows if r["email_host"] not in ("Google", "No-Email")]
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+
+    def upload_chunks(rows, category, letter):
+        for i in range(0, len(rows), chunk_size):
+            chunk = rows[i:i+chunk_size]
+            list_number = (i // chunk_size) + 1
+            chunk_filename = f"{list_number}_{today_str}_{filename}_{letter}_{len(chunk)}.csv"
+            blob_path = f"processed/{filename}/{category}/{chunk_filename}"
+
+            # Write to temp file
+            temp_path = f"/tmp/{chunk_filename}"
+            with open(temp_path, "w", newline='', encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(chunk)
+
+            # Upload to GCS
+            blob = bucket.blob(blob_path)
+            blob.upload_from_filename(temp_path)
+            print(f"✅ Uploaded {blob_path}")
+            os.remove(temp_path)
+
+    upload_chunks(google_rows, "Google", "G")
+    upload_chunks(others_rows, "Others", "O")
+
 def main():
     bucket_name = os.getenv("GCS_BUCKET")
     input_blob = os.getenv("INPUT_CSV")
@@ -191,8 +236,9 @@ def main():
     progress_blob = f"processing/{filename}.progress.json"
     process_csv(local_file, bucket_name, progress_blob)
 
-    output_blob = f"processed/{filename}"
-    upload_blob(bucket_name, local_file, output_blob)
+    # output_blob = f"processed/{filename}"
+    # upload_blob(bucket_name, local_file, output_blob)
+    split_and_upload_csv_chunks(local_file, bucket_name, os.path.splitext(filename)[0])
 
 if __name__ == "__main__":
     main()
