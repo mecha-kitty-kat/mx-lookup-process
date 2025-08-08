@@ -7,6 +7,7 @@ from tqdm import tqdm
 from google.cloud import storage
 
 MAX_WORKERS = 10
+MAX_OUTSTANDING = 500 
 
 def fetch_mx_records(domain):
     url = f"https://dns.google/resolve?name={domain}&type=mx"
@@ -60,59 +61,145 @@ def upload_progress(bucket_name, progress_blob, percent):
     blob.upload_from_string(json.dumps({"progress": percent}), content_type="application/json")
 
 
-def process_csv(input_file, bucket_name, progress_blob):
-    print("starting file processing...")
-    temp_file = input_file + ".tmp"
-    with open(input_file, mode="r", newline="", encoding="utf-8") as infile:
-        reader = csv.DictReader(infile)
-        raw_fieldnames = reader.fieldnames or []
-        fieldnames = [f.lower() for f in raw_fieldnames]
+# def process_csv(input_file, bucket_name, progress_blob):
+#     print("starting file processing...")
+#     temp_file = input_file + ".tmp"
+#     with open(input_file, mode="r", newline="", encoding="utf-8") as infile:
+#         reader = csv.DictReader(infile)
+#         raw_fieldnames = reader.fieldnames or []
+#         fieldnames = [f.lower() for f in raw_fieldnames]
 
+#         if "email_host" not in fieldnames:
+#             fieldnames.append("email_host")
+
+#         # Normalize row keys to lowercase
+#         rows = [{k.lower(): v for k, v in row.items()} for row in reader]
+#         total = len(rows)
+#     print(f"Total rows to process: {total} /n starting email processing...")
+
+#     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor, \
+#             open(temp_file, mode="w", newline="", encoding="utf-8") as outfile:
+
+#         writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+#         writer.writeheader()
+
+#         futures = {}
+#         for row in rows:
+#             if not row.get("email_host"):
+#                 email = row.get("email", "")
+#                 futures[executor.submit(process_domain, email)] = row
+#             else:
+#                 writer.writerow(row)
+
+#         completed = 0
+#         last_percent = 0
+
+#         with tqdm(total=len(futures), desc="Processing Emails") as pbar:
+#             for future in as_completed(futures):
+#                 row = futures[future]
+#                 row["email_host"] = future.result()
+#                 writer.writerow(row)
+#                 completed += 1
+#                 pbar.update(1)
+
+#                 percent = int((completed / total) * 100)
+#                 if percent >= last_percent + 5:
+#                     upload_progress(bucket_name, progress_blob, percent)
+#                     last_percent = percent
+
+#                 if pbar.n % 50 == 0:
+#                     outfile.flush()
+#                     os.fsync(outfile.fileno())
+
+#     os.replace(temp_file, input_file)
+#     upload_progress(bucket_name, progress_blob, 100)
+#     print("CSV processing complete.")
+
+def process_csv(input_file, bucket_name, progress_blob):
+    print("starting file processing...", flush=True)
+
+    # 1) Count rows (no memory cost)
+    with open(input_file, "r", encoding="utf-8", newline="") as f:
+        total = sum(1 for _ in f) - 1
+    if total < 0: total = 0
+    print(f"Total rows to process: {total}\n starting email processing...", flush=True)
+
+    temp_file = input_file + ".tmp"
+    completed = 0
+    last_percent = 0
+
+    def normalize_row(row):
+        return {k.lower(): v for k, v in row.items()}
+
+    def process_row(row):
+        # keep your existing logic
+        email = row.get("email", "")
+        host = row.get("email_host")
+        if host and host.strip():
+            return row  # already set
+        provider = process_domain(email)  # fetch_mx_records + get_email_provider
+        row["email_host"] = provider
+        return row
+
+    with open(input_file, "r", encoding="utf-8", newline="") as infile, \
+         open(temp_file,  "w", encoding="utf-8", newline="") as outfile, \
+         ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+
+        reader = csv.DictReader(infile)
+        raw_fields = reader.fieldnames or []
+        fieldnames = [f.lower() for f in raw_fields]
         if "email_host" not in fieldnames:
             fieldnames.append("email_host")
-
-        # Normalize row keys to lowercase
-        rows = [{k.lower(): v for k, v in row.items()} for row in reader]
-        total = len(rows)
-    print(f"Total rows to process: {total} /n starting email processing...")
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor, \
-            open(temp_file, mode="w", newline="", encoding="utf-8") as outfile:
-
         writer = csv.DictWriter(outfile, fieldnames=fieldnames)
         writer.writeheader()
 
-        futures = {}
-        for row in rows:
-            if not row.get("email_host"):
-                email = row.get("email", "")
-                futures[executor.submit(process_domain, email)] = row
-            else:
-                writer.writerow(row)
+        futures = []
+        for row in reader:
+            row = normalize_row(row)
 
-        completed = 0
-        last_percent = 0
-
-        with tqdm(total=len(futures), desc="Processing Emails") as pbar:
-            for future in as_completed(futures):
-                row = futures[future]
-                row["email_host"] = future.result()
+            # If it already has email_host, write directly (no job)
+            if (row.get("email_host") or "").strip():
                 writer.writerow(row)
                 completed += 1
-                pbar.update(1)
+            else:
+                # submit bounded
+                futures.append(ex.submit(process_row, row))
+                if len(futures) >= MAX_OUTSTANDING:
+                    for fut in as_completed(futures[:MAX_WORKERS]):  # drain a few to keep moving
+                        out_row = fut.result()
+                        writer.writerow(out_row)
+                        completed += 1
+                    # drop completed from the list
+                    futures = [f for f in futures if not f.done()]
 
-                percent = int((completed / total) * 100)
-                if percent >= last_percent + 5:
+            # progress updates
+            percent = int(completed * 100 / max(1, total))
+            if percent >= last_percent + 5:
+                try:
                     upload_progress(bucket_name, progress_blob, percent)
-                    last_percent = percent
+                except Exception as e:
+                    print(f"⚠️ progress upload failed: {e}", flush=True)
+                last_percent = percent
 
-                if pbar.n % 50 == 0:
-                    outfile.flush()
-                    os.fsync(outfile.fileno())
+            if completed % 2000 == 0:
+                outfile.flush()
+                os.fsync(outfile.fileno())
+
+        # drain the rest
+        for fut in as_completed(futures):
+            out_row = fut.result()
+            writer.writerow(out_row)
+            completed += 1
+            if completed % 2000 == 0:
+                outfile.flush()
+                os.fsync(outfile.fileno())
 
     os.replace(temp_file, input_file)
-    upload_progress(bucket_name, progress_blob, 100)
-    print("CSV processing complete.")
+    try:
+        upload_progress(bucket_name, progress_blob, 100)
+    except Exception as e:
+        print(f"⚠️ final progress upload failed: {e}", flush=True)
+    print("CSV processing complete.", flush=True)
 
 
 def download_blob(bucket_name, source_blob_name, destination_file_name):
