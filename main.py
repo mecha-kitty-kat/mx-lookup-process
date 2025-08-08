@@ -7,7 +7,7 @@ from tqdm import tqdm
 from google.cloud import storage
 
 MAX_WORKERS = 10
-MAX_OUTSTANDING = 1000 
+MAX_OUTSTANDING = 500 
 
 def fetch_mx_records(domain):
     url = f"https://dns.google/resolve?name={domain}&type=mx"
