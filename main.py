@@ -191,7 +191,7 @@ def main():
 
     # output_blob = f"processed/{filename}"
     # upload_blob(bucket_name, local_file, output_blob)
-    split_and_upload_csv_chunks(local_file, bucket_name, os.path.splitext(filename)[0])
+    # split_and_upload_csv_chunks(local_file, bucket_name, os.path.splitext(filename)[0])
 
 if __name__ == "__main__":
     main()
