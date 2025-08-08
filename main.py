@@ -118,7 +118,7 @@ def upload_progress(bucket_name, progress_blob, percent):
 def process_csv(input_file, bucket_name, progress_blob):
     print("starting file processing...", flush=True)
 
-    # 1) Count rows (no memory cost)
+    # Count rows first
     with open(input_file, "r", encoding="utf-8", newline="") as f:
         total = sum(1 for _ in f) - 1
     if total < 0: total = 0
@@ -132,18 +132,18 @@ def process_csv(input_file, bucket_name, progress_blob):
         return {k.lower(): v for k, v in row.items()}
 
     def process_row(row):
-        # keep your existing logic
         email = row.get("email", "")
         host = row.get("email_host")
         if host and host.strip():
-            return row  # already set
-        provider = process_domain(email)  # fetch_mx_records + get_email_provider
+            return row
+        provider = process_domain(email)
         row["email_host"] = provider
         return row
 
     with open(input_file, "r", encoding="utf-8", newline="") as infile, \
-         open(temp_file,  "w", encoding="utf-8", newline="") as outfile, \
-         ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+         open(temp_file, "w", encoding="utf-8", newline="") as outfile, \
+         ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex, \
+         tqdm(total=total, desc="Processing Emails", unit="row") as pbar:
 
         reader = csv.DictReader(infile)
         raw_fields = reader.fieldnames or []
@@ -157,22 +157,20 @@ def process_csv(input_file, bucket_name, progress_blob):
         for row in reader:
             row = normalize_row(row)
 
-            # If it already has email_host, write directly (no job)
             if (row.get("email_host") or "").strip():
                 writer.writerow(row)
                 completed += 1
+                pbar.update(1)
             else:
-                # submit bounded
                 futures.append(ex.submit(process_row, row))
                 if len(futures) >= MAX_OUTSTANDING:
-                    for fut in as_completed(futures[:MAX_WORKERS]):  # drain a few to keep moving
+                    for fut in as_completed(futures[:MAX_WORKERS]):
                         out_row = fut.result()
                         writer.writerow(out_row)
                         completed += 1
-                    # drop completed from the list
+                        pbar.update(1)
                     futures = [f for f in futures if not f.done()]
 
-            # progress updates
             percent = int(completed * 100 / max(1, total))
             if percent >= last_percent + 5:
                 try:
@@ -185,11 +183,12 @@ def process_csv(input_file, bucket_name, progress_blob):
                 outfile.flush()
                 os.fsync(outfile.fileno())
 
-        # drain the rest
+        # Drain remaining
         for fut in as_completed(futures):
             out_row = fut.result()
             writer.writerow(out_row)
             completed += 1
+            pbar.update(1)
             if completed % 2000 == 0:
                 outfile.flush()
                 os.fsync(outfile.fileno())
@@ -200,7 +199,6 @@ def process_csv(input_file, bucket_name, progress_blob):
     except Exception as e:
         print(f"⚠️ final progress upload failed: {e}", flush=True)
     print("CSV processing complete.", flush=True)
-
 
 def download_blob(bucket_name, source_blob_name, destination_file_name):
     client = storage.Client()
